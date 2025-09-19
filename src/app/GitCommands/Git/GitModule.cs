@@ -872,10 +872,11 @@ namespace GitCommands
         public (int? First, int? Second) GetCommitRangeDiffCount(ObjectId firstId, ObjectId secondId)
         {
             string second = secondId.IsArtificial ? "HEAD" : secondId.ToString();
-            return GetRevListLeftRightCount(firstId, second);
+            bool cache = !firstId.IsArtificial && !secondId.IsArtificial;
+            return GetRevListLeftRightCount(firstId, second, cache, throwOnErrorExit: false);
         }
 
-        private (int? First, int? Second) GetRevListLeftRightCount(ObjectId firstId, string secondRef)
+        private (int? left, int? right) GetRevListLeftRightCount(ObjectId firstId, string secondRef, bool cache, bool throwOnErrorExit = true)
         {
             string firstRef = firstId.IsArtificial ? "HEAD" : firstId.ToString();
             if (firstRef == secondRef)
@@ -889,9 +890,15 @@ namespace GitCommands
                 "--count",
                 "--left-right"
             };
-            string output = _gitExecutable.GetOutput(args, cache: GitCommandCache);
 
-            string[] counts = output.Split(Delimiters.Tab);
+            ExecutionResult result = _gitExecutable.Execute(args, cache: cache ? GitCommandCache : null, throwOnErrorExit: throwOnErrorExit);
+            if (!result.ExitedSuccessfully)
+            {
+                // this is likely one of the commits in a submodule no longer existing
+                return (null, null);
+            }
+
+            string[] counts = result.StandardOutput.Split(Delimiters.Tab);
             if (counts.Length == 2 && int.TryParse(counts[0], out int first) && int.TryParse(counts[1], out int second))
             {
                 return (first, second);
@@ -902,7 +909,8 @@ namespace GitCommands
 
         public string GetCommitCountString(ObjectId fromId, string to)
         {
-            (int? added, int? removed) = GetRevListLeftRightCount(fromId, to);
+            bool cache = !fromId.IsArtificial && ObjectId.TryParse(to, out ObjectId toId) && !toId.IsArtificial;
+            (int? added, int? removed) = GetRevListLeftRightCount(fromId, to, cache);
 
             if (removed is null || added is null)
             {
@@ -2568,13 +2576,15 @@ namespace GitCommands
                 .Select(file => new GitItemStatus(file.Name)
                 {
                     // IsTracked is always true, only tracked are reported
+                    // (all with TreeId are tracked)
+                    // TreeGuid for worktree reflects Index, just for reference
                     // New/Changed/Deleted are are just set
                     IsTracked = true,
                     IsNew = false,
                     IsChanged = false,
                     IsDeleted = false,
-                    TreeGuid = file.ObjectId,
                     Staged = StagedStatus.Unset,
+                    TreeGuid = file.ObjectId,
                     IsSubmodule = file.ObjectType == GitObjectType.Commit
                 })
                 .ToList();
@@ -3208,7 +3218,9 @@ namespace GitCommands
                     // ls-files with same format as ls-tree
                     "-z",
                     { commitId == ObjectId.IndexId, "--cached", "--no-cached" },
-                    @$"--format=""{_gitTreeParser.GitTreeFormat}""",
+
+                    // TODO change to GitVersion.SupportLsFilesFormat when Extensibility.Git can be updated
+                    { GitVersion.SupportUpdateRefs, @$"--format=""{_gitTreeParser.GitTreeFormat}""", "--stage" },
                     "--",
                     fileName.QuoteNE()
                 }
@@ -3217,12 +3229,17 @@ namespace GitCommands
                     // optimized codepath, default is "--format={_gitTreeParser.GitTreeFormat}"
                     "-z",
                     { full, "-r" },
-                    commitId,
+                    { commitId is null, "HEAD", commitId.ToString() },
                     "--",
                     fileName.QuoteNE()
                 };
 
             ExecutionResult result = _gitExecutable.Execute(args, cache: isArtificial ? null : GitCommandCache, cancellationToken: cancellationToken);
+
+            if (isArtificial && !GitVersion.SupportUpdateRefs)
+            {
+                return _gitTreeParser.ParseLsFiles(result.StandardOutput);
+            }
 
             return _gitTreeParser.Parse(result.StandardOutput);
         }
@@ -3510,9 +3527,9 @@ namespace GitCommands
 
         public ObjectId? GetFileBlobHash(string fileName, ObjectId objectId)
         {
-            IEnumerable<IObjectGitItem> items = GetTree(objectId, full: true, fileName);
-            return items.Count() == 1 && items.First() is IObjectGitItem i && i.ObjectType is GitObjectType.Blob
-                ? i.ObjectId
+            IObjectGitItem[] items = GetTree(objectId, full: true, fileName).ToArray();
+            return items.Length == 1 && items[0].ObjectType is GitObjectType.Blob
+                ? items[0].ObjectId
                 : null;
         }
 
